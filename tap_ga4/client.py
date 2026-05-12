@@ -15,6 +15,17 @@ from google.oauth2.credentials import Credentials
 
 LOGGER = singer.get_logger()
 
+TIME_DIMENSIONS = ("date", "dateHour", "dateHourMinute", "firstSessionDate")
+
+
+def _build_order_bys(dimensions):
+    selected = {d.name for d in dimensions}
+    for name in TIME_DIMENSIONS:
+        if name in selected:
+            return [OrderBy(dimension=OrderBy.DimensionOrderBy(
+                dimension_name=name, order_type="NUMERIC"))]
+    return []
+
 
 def sleep_if_quota_reached(ex):
     if isinstance(ex, ResourceExhausted):
@@ -113,7 +124,7 @@ class Client:
                 limit=self.PAGE_SIZE,
                 offset=offset,
                 return_property_quota=True,
-                order_bys=[OrderBy(dimension=OrderBy.DimensionOrderBy(dimension_name="date", order_type="NUMERIC"))],
+                order_bys=_build_order_bys(report["dimensions"]),
                 dimension_filter= dimension_filters
             )
             response = self._make_request(request)
