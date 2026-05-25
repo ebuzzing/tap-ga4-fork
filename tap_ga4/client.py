@@ -8,7 +8,8 @@ from google.analytics.data_v1beta.types import (CheckCompatibilityRequest,
                                                 DateRange, Dimension,
                                                 GetMetadataRequest, Metric,
                                                 OrderBy, RunReportRequest,
-                                                Filter, FilterExpression)
+                                                Filter, FilterExpression,
+                                                FilterExpressionList)
 from google.api_core.exceptions import (ResourceExhausted, ServerError,
                                         TooManyRequests)
 from google.oauth2.credentials import Credentials
@@ -53,6 +54,35 @@ class Client:
             self.client = self._create_service_account_client(config)
         else:
             raise ValueError(f"Unknown auth_type: {auth_type}")
+
+        self._landing_page_filter = self._build_landing_page_filter(
+            config.get("landing_page_plus_query_string_regexes") or []
+        )
+
+    @staticmethod
+    def _build_landing_page_filter(regexes):
+        """Build a FilterExpression on landingPagePlusQueryString from a list of regex patterns.
+
+        Returns None when the list is empty, a flat FilterExpression for a single pattern,
+        or an or_group for multiple patterns.
+        """
+        if not regexes:
+            return None
+        expressions = [
+            FilterExpression(
+                filter=Filter(
+                    field_name="landingPagePlusQueryString",
+                    string_filter=Filter.StringFilter(
+                        value=pattern,
+                        match_type=Filter.StringFilter.MatchType.FULL_REGEXP,
+                    ),
+                )
+            )
+            for pattern in regexes
+        ]
+        if len(expressions) == 1:
+            return expressions[0]
+        return FilterExpression(or_group=FilterExpressionList(expressions=expressions))
 
     def _create_oauth_client(self, config):
         """Create a BetaAnalyticsDataClient using OAuth credentials."""
@@ -110,10 +140,12 @@ class Client:
         """
         offset = 0
         has_more_rows = True
-        dimension_filters = None
+        hardcoded_filter = None
         # Dimension filters are hardcoded for premade reports
         if report["name"] in ["conversions_report", "in_app_purchases"]:
-            dimension_filters = self.get_premade_report_dimension_filter(report["name"])
+            hardcoded_filter = self.get_premade_report_dimension_filter(report["name"])
+
+        dimension_filters = self._combine_filters(hardcoded_filter, self._landing_page_filter)
 
         while has_more_rows:
             request = RunReportRequest(
@@ -163,6 +195,18 @@ class Client:
             compatibility_filter="INCOMPATIBLE"
             )
         return self._make_request(request)
+
+
+    @staticmethod
+    def _combine_filters(first, second):
+        """AND-combine two optional FilterExpressions. Returns whichever is set, or None."""
+        if first is None:
+            return second
+        if second is None:
+            return first
+        return FilterExpression(
+            and_group=FilterExpressionList(expressions=[first, second])
+        )
 
 
     def get_premade_report_dimension_filter(self, report_name):

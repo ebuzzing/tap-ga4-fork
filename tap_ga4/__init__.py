@@ -106,6 +106,25 @@ def maybe_parse_report_definitions(config):
         except json.JSONDecodeError as e:
             raise ValueError(f"Error parsing report_definitions string: {e}") from e
 
+
+def maybe_parse_landing_page_regexes(config):
+    """Converts landing_page_plus_query_string_regexes into a list of strings if it is a JSON-encoded string."""
+    value = config.get("landing_page_plus_query_string_regexes")
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Error parsing landing_page_plus_query_string_regexes string: {e}") from e
+        config["landing_page_plus_query_string_regexes"] = parsed
+        value = parsed
+    if value is None:
+        return
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(
+            "landing_page_plus_query_string_regexes must be a list of regex strings"
+        )
+
+
 def main_impl():
     args = utils.parse_args(REQUIRED_CONFIG_KEYS)
     catalog = args.catalog or Catalog([])
@@ -118,6 +137,7 @@ def main_impl():
     LOGGER.info("Using %s authentication", auth_type)
 
     maybe_parse_report_definitions(config)
+    maybe_parse_landing_page_regexes(config)
 
     client = Client(config, auth_type=auth_type)
 
