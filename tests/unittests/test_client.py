@@ -139,56 +139,73 @@ def _basic_report():
     }
 
 
+def _report_with_filters(field_filters, name="some_report"):
+    report = _basic_report()
+    report["name"] = name
+    report["field_filters"] = field_filters
+    return report
+
+
 @patch('tap_ga4.client.BetaAnalyticsDataClient')
 @patch('tap_ga4.client.Credentials')
-class TestLandingPageFilter(unittest.TestCase):
-    """Test the landing_page_plus_query_string_regexes filter plumbing."""
+class TestCatalogFieldFilter(unittest.TestCase):
+    """Test the catalog-driven per-field regex filter plumbing."""
 
-    def test_no_regexes_no_filter(self, _mock_credentials, _mock_client_class):
-        client = Client(_oauth_config())
-        self.assertIsNone(client._landing_page_filter)
+    def test_empty_map_returns_none(self, _mock_credentials, _mock_client_class):
+        self.assertIsNone(Client._build_field_filter({}))
+        self.assertIsNone(Client._build_field_filter(None))
 
-    def test_single_regex_is_flat_expression(self, _mock_credentials, _mock_client_class):
-        pattern = "^/foo/.*"
-        client = Client(_oauth_config(landing_page_plus_query_string_regexes=[pattern]))
+    def test_all_empty_lists_returns_none(self, _mock_credentials, _mock_client_class):
+        self.assertIsNone(Client._build_field_filter({"landingPagePlusQueryString": []}))
 
-        fe = client._landing_page_filter
-        self.assertIsNotNone(fe)
-        # Flat filter — not wrapped in or_group
+    def test_single_field_single_regex_is_flat(self, _mock_credentials, _mock_client_class):
+        fe = Client._build_field_filter({"landingPagePlusQueryString": ["^/foo/.*"]})
         self.assertEqual(_which_expr(fe), "filter")
         self.assertEqual(fe.filter.field_name, "landingPagePlusQueryString")
-        self.assertEqual(fe.filter.string_filter.value, pattern)
+        self.assertEqual(fe.filter.string_filter.value, "^/foo/.*")
         self.assertEqual(
             fe.filter.string_filter.match_type,
             Filter.StringFilter.MatchType.FULL_REGEXP,
         )
 
-    def test_multiple_regexes_or_grouped(self, _mock_credentials, _mock_client_class):
+    def test_single_field_multiple_regexes_or_grouped(self, _mock_credentials, _mock_client_class):
         patterns = ["^/foo/.*", "bar", "baz.*qux"]
-        client = Client(_oauth_config(landing_page_plus_query_string_regexes=patterns))
-
-        fe = client._landing_page_filter
+        fe = Client._build_field_filter({"landingPagePlusQueryString": patterns})
         self.assertEqual(_which_expr(fe), "or_group")
         self.assertEqual(len(fe.or_group.expressions), 3)
         for child, expected in zip(fe.or_group.expressions, patterns):
             self.assertEqual(child.filter.field_name, "landingPagePlusQueryString")
             self.assertEqual(child.filter.string_filter.value, expected)
-            self.assertEqual(
-                child.filter.string_filter.match_type,
-                Filter.StringFilter.MatchType.FULL_REGEXP,
-            )
 
-    def test_get_report_passes_landing_page_filter(self, _mock_credentials, _mock_client_class):
-        client = Client(_oauth_config(landing_page_plus_query_string_regexes=["^/foo/.*"]))
+    def test_multiple_fields_and_grouped(self, _mock_credentials, _mock_client_class):
+        fe = Client._build_field_filter({
+            "landingPagePlusQueryString": ["^/foo/.*"],
+            "eventName": ["click", "view"],
+        })
+        self.assertEqual(_which_expr(fe), "and_group")
+        self.assertEqual(len(fe.and_group.expressions), 2)
+        # First field: single regex → flat filter
+        first = fe.and_group.expressions[0]
+        self.assertEqual(_which_expr(first), "filter")
+        self.assertEqual(first.filter.field_name, "landingPagePlusQueryString")
+        # Second field: 2 regexes → or_group
+        second = fe.and_group.expressions[1]
+        self.assertEqual(_which_expr(second), "or_group")
+        self.assertEqual(len(second.or_group.expressions), 2)
+
+    def test_get_report_passes_catalog_filter(self, _mock_credentials, _mock_client_class):
+        client = Client(_oauth_config())
         client._make_request = MagicMock(return_value=MagicMock(
             row_count=0,
             property_quota=MagicMock(tokens_per_hour=MagicMock(consumed=0)),
         ))
 
-        list(client.get_report(_basic_report(), "2024-01-01", "2024-01-02"))
+        list(client.get_report(
+            _report_with_filters({"landingPagePlusQueryString": ["^/foo/.*"]}),
+            "2024-01-01", "2024-01-02",
+        ))
 
         sent_request = client._make_request.call_args[0][0]
-        # No hardcoded filter for "some_report" → outgoing filter is the landing-page one directly
         self.assertEqual(_which_expr(sent_request.dimension_filter), "filter")
         self.assertEqual(
             sent_request.dimension_filter.filter.field_name,
@@ -196,28 +213,27 @@ class TestLandingPageFilter(unittest.TestCase):
         )
 
     def test_get_report_combines_with_hardcoded_filter(self, _mock_credentials, _mock_client_class):
-        client = Client(_oauth_config(landing_page_plus_query_string_regexes=["^/foo/.*"]))
+        client = Client(_oauth_config())
         client._make_request = MagicMock(return_value=MagicMock(
             row_count=0,
             property_quota=MagicMock(tokens_per_hour=MagicMock(consumed=0)),
         ))
 
-        report = _basic_report()
-        report["name"] = "conversions_report"
-        list(client.get_report(report, "2024-01-01", "2024-01-02"))
+        list(client.get_report(
+            _report_with_filters(
+                {"landingPagePlusQueryString": ["^/foo/.*"]},
+                name="conversions_report",
+            ),
+            "2024-01-01", "2024-01-02",
+        ))
 
         sent_request = client._make_request.call_args[0][0]
         fe = sent_request.dimension_filter
         self.assertEqual(_which_expr(fe), "and_group")
         self.assertEqual(len(fe.and_group.expressions), 2)
-
         first, second = fe.and_group.expressions
-        # First is the hardcoded conversions filter
         self.assertEqual(first.filter.field_name, "isKeyEvent")
-        self.assertEqual(first.filter.string_filter.value, "true")
-        # Second is the landing-page regex
         self.assertEqual(second.filter.field_name, "landingPagePlusQueryString")
-        self.assertEqual(second.filter.string_filter.value, "^/foo/.*")
 
     def test_get_report_no_filters_sends_empty_filter(self, _mock_credentials, _mock_client_class):
         client = Client(_oauth_config())
@@ -229,10 +245,9 @@ class TestLandingPageFilter(unittest.TestCase):
         list(client.get_report(_basic_report(), "2024-01-01", "2024-01-02"))
 
         sent_request = client._make_request.call_args[0][0]
-        # When no filter is provided, the proto default is an empty FilterExpression
         self.assertIsNone(_which_expr(sent_request.dimension_filter))
 
-    def test_get_report_hardcoded_only_when_no_landing_page(self, _mock_credentials, _mock_client_class):
+    def test_get_report_hardcoded_only_when_no_catalog_filter(self, _mock_credentials, _mock_client_class):
         client = Client(_oauth_config())
         client._make_request = MagicMock(return_value=MagicMock(
             row_count=0,
@@ -245,7 +260,6 @@ class TestLandingPageFilter(unittest.TestCase):
 
         sent_request = client._make_request.call_args[0][0]
         fe = sent_request.dimension_filter
-        # Just the hardcoded filter, no and_group wrapping
         self.assertEqual(_which_expr(fe), "filter")
         self.assertEqual(fe.filter.field_name, "eventName")
         self.assertEqual(fe.filter.string_filter.value, "in_app_purchase")

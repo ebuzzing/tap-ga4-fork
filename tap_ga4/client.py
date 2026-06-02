@@ -55,34 +55,46 @@ class Client:
         else:
             raise ValueError(f"Unknown auth_type: {auth_type}")
 
-        self._landing_page_filter = self._build_landing_page_filter(
-            config.get("landing_page_plus_query_string_regexes") or []
-        )
-
     @staticmethod
-    def _build_landing_page_filter(regexes):
-        """Build a FilterExpression on landingPagePlusQueryString from a list of regex patterns.
+    def _build_field_filter(field_filters):
+        """Build a FilterExpression from a {api_field_name: [regex, ...]} mapping.
 
-        Returns None when the list is empty, a flat FilterExpression for a single pattern,
-        or an or_group for multiple patterns.
+        - Each field with N patterns becomes a single Filter (N == 1) or an or_group of N
+          FULL_REGEXP filters.
+        - Multiple fields are AND-grouped together.
+        - Returns None if the map is empty or contains only empty pattern lists.
         """
-        if not regexes:
+        if not field_filters:
             return None
-        expressions = [
-            FilterExpression(
-                filter=Filter(
-                    field_name="landingPagePlusQueryString",
-                    string_filter=Filter.StringFilter(
-                        value=pattern,
-                        match_type=Filter.StringFilter.MatchType.FULL_REGEXP,
-                    ),
+        per_field_expressions = []
+        for field_name, patterns in field_filters.items():
+            if not patterns:
+                continue
+            exprs = [
+                FilterExpression(
+                    filter=Filter(
+                        field_name=field_name,
+                        string_filter=Filter.StringFilter(
+                            value=pattern,
+                            match_type=Filter.StringFilter.MatchType.FULL_REGEXP,
+                        ),
+                    )
                 )
-            )
-            for pattern in regexes
-        ]
-        if len(expressions) == 1:
-            return expressions[0]
-        return FilterExpression(or_group=FilterExpressionList(expressions=expressions))
+                for pattern in patterns
+            ]
+            if len(exprs) == 1:
+                per_field_expressions.append(exprs[0])
+            else:
+                per_field_expressions.append(
+                    FilterExpression(or_group=FilterExpressionList(expressions=exprs))
+                )
+        if not per_field_expressions:
+            return None
+        if len(per_field_expressions) == 1:
+            return per_field_expressions[0]
+        return FilterExpression(
+            and_group=FilterExpressionList(expressions=per_field_expressions)
+        )
 
     def _create_oauth_client(self, config):
         """Create a BetaAnalyticsDataClient using OAuth credentials."""
@@ -145,7 +157,8 @@ class Client:
         if report["name"] in ["conversions_report", "in_app_purchases"]:
             hardcoded_filter = self.get_premade_report_dimension_filter(report["name"])
 
-        dimension_filters = self._combine_filters(hardcoded_filter, self._landing_page_filter)
+        catalog_field_filter = self._build_field_filter(report.get("field_filters") or {})
+        dimension_filters = self._combine_filters(hardcoded_filter, catalog_field_filter)
 
         while has_more_rows:
             request = RunReportRequest(

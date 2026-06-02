@@ -1,5 +1,5 @@
 import unittest
-from tap_ga4 import maybe_parse_report_definitions, maybe_parse_landing_page_regexes
+from tap_ga4 import maybe_parse_report_definitions
 
 
 class TestMaybeParseReportDefinitions(unittest.TestCase):
@@ -48,42 +48,3 @@ class TestMaybeParseReportDefinitions(unittest.TestCase):
         self.assertEqual(self.config_with_bad_type["start_date"], '2024-02-24T00:00:00Z')
 
 
-class TestMaybeParseLandingPageRegexes(unittest.TestCase):
-    def test_absent(self):
-        """Config without the key is left untouched."""
-        config = {'start_date': '2024-02-24T00:00:00Z'}
-        maybe_parse_landing_page_regexes(config)
-        self.assertNotIn("landing_page_plus_query_string_regexes", config)
-
-    def test_with_list(self):
-        """A list of strings is left as-is."""
-        config = {"landing_page_plus_query_string_regexes": ["^/foo/.*", "bar"]}
-        maybe_parse_landing_page_regexes(config)
-        self.assertEqual(config["landing_page_plus_query_string_regexes"], ["^/foo/.*", "bar"])
-
-    def test_with_string(self):
-        """A JSON-encoded string is parsed into a list."""
-        config = {"landing_page_plus_query_string_regexes": '["^/foo/.*", "bar"]'}
-        maybe_parse_landing_page_regexes(config)
-        self.assertEqual(config["landing_page_plus_query_string_regexes"], ["^/foo/.*", "bar"])
-
-    def test_with_empty_list(self):
-        """An empty list is accepted."""
-        config = {"landing_page_plus_query_string_regexes": []}
-        maybe_parse_landing_page_regexes(config)
-        self.assertEqual(config["landing_page_plus_query_string_regexes"], [])
-
-    def test_with_non_string_entries_raises(self):
-        config = {"landing_page_plus_query_string_regexes": ["ok", 123]}
-        with self.assertRaises(ValueError):
-            maybe_parse_landing_page_regexes(config)
-
-    def test_with_non_list_raises(self):
-        config = {"landing_page_plus_query_string_regexes": 12345}
-        with self.assertRaises(ValueError):
-            maybe_parse_landing_page_regexes(config)
-
-    def test_with_malformed_json_string_raises(self):
-        config = {"landing_page_plus_query_string_regexes": '["unterminated'}
-        with self.assertRaises(ValueError):
-            maybe_parse_landing_page_regexes(config)
