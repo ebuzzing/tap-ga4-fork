@@ -217,6 +217,7 @@ def sync(client, config, catalog, state):
 
         metrics = []
         dimensions = []
+        field_filters = {}
         mdata = metadata.to_map(stream.metadata)
         for field_path, field_mdata in mdata.items():
             if field_path == tuple():
@@ -226,10 +227,14 @@ def sync(client, config, catalog, state):
             if field_mdata.get("inclusion") == "automatic" or \
                field_mdata.get("selected") or \
                (field_mdata.get("selected-by-default") and field_mdata.get("selected") is None):
+                api_name = field_mdata.get("tap-ga4.api-field-names")
                 if field_mdata.get("behavior") == "METRIC":
-                    metrics.append(Metric(name=field_mdata.get("tap-ga4.api-field-names")))
+                    metrics.append(Metric(name=api_name))
                 elif field_mdata.get("behavior") == "DIMENSION":
-                    dimensions.append(Dimension(name=field_mdata.get("tap-ga4.api-field-names")))
+                    dimensions.append(Dimension(name=api_name))
+                    regexes = field_mdata.get("tap-ga4.field-filter-regexes") or []
+                    if regexes:
+                        field_filters[api_name] = list(regexes)
 
         end_date = get_end_date(config)
         schema = stream.schema.to_dict()
@@ -242,7 +247,8 @@ def sync(client, config, catalog, state):
                   "name": stream.stream,
                   "id": stream.tap_stream_id,
                   "metrics": metrics,
-                  "dimensions": dimensions}
+                  "dimensions": dimensions,
+                  "field_filters": field_filters}
 
         start_date = get_report_start_date(config, report["property_id"], state, report["id"])
         request_window_size = int(config.get("request_window_size", DEFAULT_REQUEST_WINDOW_SIZE))
