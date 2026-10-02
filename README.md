@@ -128,6 +128,35 @@ applies only to dimensions actually selected for sync.
 
 ---
 
+## Report metadata log line
+
+For every RunReport response (one page of a date window), the tap logs one
+single-line JSON entry to stderr, prefixed with the marker
+`GA4_REPORT_METADATA`, before writing that page's records. It is emitted
+whether or not GA4 reported data loss, and before record writing so it still
+reaches the consumer when writing fails (with the discovered catalog, a
+`(other)` `dateHour` does not match the `date-time` schema and aborts the
+tap). stdout (the Singer stream) is unchanged; records are always forwarded as
+GA4 returned them.
+
+```
+INFO GA4_REPORT_METADATA {"stream":"report_name","tap_stream_id":"report_id","property_id":"123456789","start_date":"2026-09-01","end_date":"2026-09-01","page":0,"dimensions":["dateHour","pagePath"],"metrics":["sessions"],"data_loss_from_other_row":true,"row_count":1234,"page_rows":1234,"other_rows":1,"time_zone":"Europe/Paris","currency_code":"EUR"}
+```
+
+- `data_loss_from_other_row`: GA4's `ResponseMetaData.dataLossFromOtherRow`,
+  i.e. some rows were aggregated into `(other)` because of high-cardinality
+  dimensions. GA4 sets it regardless of filters and limits, so it can be true
+  with `other_rows: 0`.
+- `page`: 0-based page index within the date window.
+- `row_count`: GA4's total row count for the window; `page_rows`: rows in this
+  response.
+- `other_rows`: rows in this response with any dimension value `(other)`.
+
+The marker and field names are a contract for downstream consumers; keep them
+stable.
+
+---
+
 ## Tests
 
 Unit tests (offline):

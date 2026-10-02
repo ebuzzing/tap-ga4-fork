@@ -13,6 +13,11 @@ LOGGER = singer.get_logger()
 DEFAULT_CONVERSION_WINDOW = 90
 DEFAULT_REQUEST_WINDOW_SIZE = 7
 
+# Marker for the one-line JSON log entry emitted per RunReport response.
+# Downstream consumers grep stderr for it; keep the marker and field names stable.
+REPORT_METADATA_MARKER = "GA4_REPORT_METADATA"
+OTHER_ROW_VALUE = "(other)"
+
 
 def sort_and_shuffle_streams(currently_syncing, selected_streams):
     """
@@ -131,6 +136,42 @@ def transform_datetimes(report_name, rec):
     return rec
 
 
+def count_other_rows(response):
+    """Count rows where any dimension value is `(other)` (rows GA4 aggregated)."""
+    return sum(1 for row in response.rows
+               if any(dimension.value == OTHER_ROW_VALUE for dimension in row.dimension_values))
+
+
+def build_report_metadata(report, range_start_date, range_end_date, page, response):
+    """
+    Summarize one RunReport response (one page of a date window).
+
+    `data_loss_from_other_row` is populated by GA4 from the aggregated table the report
+    was built from, regardless of filters and limits, so it is set even when a filter
+    removed the `(other)` row itself.
+    """
+    return {
+        "stream": report["name"],
+        "tap_stream_id": report["id"],
+        "property_id": report["property_id"],
+        "start_date": range_start_date,
+        "end_date": range_end_date,
+        "page": page,
+        "dimensions": [dimension.name for dimension in report["dimensions"]],
+        "metrics": [metric.name for metric in report["metrics"]],
+        "data_loss_from_other_row": bool(response.metadata.data_loss_from_other_row),
+        "row_count": response.row_count,
+        "page_rows": len(response.rows),
+        "other_rows": count_other_rows(response),
+        "time_zone": response.metadata.time_zone,
+        "currency_code": response.metadata.currency_code,
+    }
+
+
+def log_report_metadata(report_metadata):
+    LOGGER.info("%s %s", REPORT_METADATA_MARKER, json.dumps(report_metadata, separators=(",", ":")))
+
+
 def get_report_start_date(config, property_id, state, tap_stream_id):
     """
     Returns the correct report start date.
@@ -184,7 +225,11 @@ def sync_report(client, schema, report, start_date, end_date, request_window_siz
     LOGGER.info("Syncing %s for property_id %s", report['name'], report['property_id'])
 
     for range_start_date, range_end_date in generate_report_dates(start_date, end_date, request_window_size):
-        for response in client.get_report(report, range_start_date, range_end_date):
+        for page, response in enumerate(client.get_report(report, range_start_date, range_end_date)):
+            # Logged before the page's records: writing them can still fail (e.g. a `(other)`
+            # dateHour does not match the date-time schema), and the flag must reach the
+            # consumer in exactly that case.
+            log_report_metadata(build_report_metadata(report, range_start_date, range_end_date, page, response))
             dimension_headers = [dimension.name for dimension in response.dimension_headers]
             metric_headers = [metric.name for metric in response.metric_headers]
             with singer.metrics.record_counter(report['name']) as counter:
