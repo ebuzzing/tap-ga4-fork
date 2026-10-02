@@ -128,6 +128,41 @@ applies only to dimensions actually selected for sync.
 
 ---
 
+## Report metadata state
+
+For every RunReport response (one page of a date window), the tap writes one
+Singer STATE message whose `value` carries the response's metadata under
+`report_metadata`, next to the unchanged `bookmarks` and `currently_syncing`.
+It is written whether or not GA4 reported data loss, after the stream's SCHEMA
+and before that page's records, so it still reaches the consumer when writing
+the records fails (with the discovered catalog, a `(other)` `dateHour` does not
+match the `date-time` schema and aborts the tap). Records are always forwarded
+as GA4 returned them; whether data loss is acceptable is the consumer's call.
+
+```json
+{"type": "STATE", "value": {"currently_syncing": "report_id", "bookmarks": {...}, "report_metadata": {"stream": "report_name", "tap_stream_id": "report_id", "property_id": "123456789", "start_date": "2026-09-01", "end_date": "2026-09-01", "page": 0, "dimensions": ["dateHour", "pagePath"], "metrics": ["sessions"], "data_loss_from_other_row": true, "row_count": 1234, "page_rows": 1234, "other_rows": 1, "time_zone": "Europe/Paris", "currency_code": "EUR"}}}
+```
+
+- `data_loss_from_other_row`: GA4's `ResponseMetaData.dataLossFromOtherRow`,
+  i.e. some rows were aggregated into `(other)` because of high-cardinality
+  dimensions. GA4 sets it regardless of filters and limits, so it can be true
+  with `other_rows: 0`.
+- `page`: 0-based page index within the date window.
+- `row_count`: GA4's total row count for the window; `page_rows`: rows in this
+  response.
+- `other_rows`: rows in this response with any dimension value `(other)`.
+
+The bookmark is not advanced in these messages, so resuming from one re-syncs
+the window. `report_metadata` appears only on the STATE written right after its
+response: later states (including the final one an orchestrator persists) omit
+it, and the tap drops it from an input `--state`. Targets pass STATE through
+untouched, so no extra table or column is created.
+
+The key and field names are a contract for downstream consumers; keep them
+stable.
+
+---
+
 ## Tests
 
 Unit tests (offline):
