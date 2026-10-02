@@ -13,9 +13,10 @@ LOGGER = singer.get_logger()
 DEFAULT_CONVERSION_WINDOW = 90
 DEFAULT_REQUEST_WINDOW_SIZE = 7
 
-# Marker for the one-line JSON log entry emitted per RunReport response.
-# Downstream consumers grep stderr for it; keep the marker and field names stable.
-REPORT_METADATA_MARKER = "GA4_REPORT_METADATA"
+# State key carrying the metadata of one RunReport response. It is set only on the STATE
+# message written right after that response, before its records, and is never persisted
+# in later states. Downstream consumers read it; keep the key and field names stable.
+REPORT_METADATA_KEY = "report_metadata"
 OTHER_ROW_VALUE = "(other)"
 
 
@@ -168,8 +169,13 @@ def build_report_metadata(report, range_start_date, range_end_date, page, respon
     }
 
 
-def log_report_metadata(report_metadata):
-    LOGGER.info("%s %s", REPORT_METADATA_MARKER, json.dumps(report_metadata, separators=(",", ":")))
+def write_report_metadata_state(state, report_metadata):
+    """Write a STATE message carrying `report_metadata` next to the unchanged bookmarks."""
+    state[REPORT_METADATA_KEY] = report_metadata
+    try:
+        singer.write_state(state)
+    finally:
+        state.pop(REPORT_METADATA_KEY, None)
 
 
 def get_report_start_date(config, property_id, state, tap_stream_id):
@@ -226,10 +232,12 @@ def sync_report(client, schema, report, start_date, end_date, request_window_siz
 
     for range_start_date, range_end_date in generate_report_dates(start_date, end_date, request_window_size):
         for page, response in enumerate(client.get_report(report, range_start_date, range_end_date)):
-            # Logged before the page's records: writing them can still fail (e.g. a `(other)`
+            # Written before the page's records: writing them can still fail (e.g. a `(other)`
             # dateHour does not match the date-time schema), and the flag must reach the
-            # consumer in exactly that case.
-            log_report_metadata(build_report_metadata(report, range_start_date, range_end_date, page, response))
+            # consumer in exactly that case. The bookmark is not advanced yet, so resuming
+            # from this state still re-syncs the window.
+            write_report_metadata_state(
+                state, build_report_metadata(report, range_start_date, range_end_date, page, response))
             dimension_headers = [dimension.name for dimension in response.dimension_headers]
             metric_headers = [metric.name for metric in response.metric_headers]
             with singer.metrics.record_counter(report['name']) as counter:
@@ -252,6 +260,8 @@ def sync_report(client, schema, report, start_date, end_date, request_window_siz
 
 
 def sync(client, config, catalog, state):
+    # A consumer may have persisted a metadata-carrying state; it describes a past response.
+    state.pop(REPORT_METADATA_KEY, None)
     selected_streams = catalog.get_selected_streams(state)
     currently_syncing = state.get("currently_syncing", None)
     selected_streams = sort_and_shuffle_streams(currently_syncing, selected_streams)

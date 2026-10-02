@@ -5,8 +5,8 @@ from unittest.mock import MagicMock, patch
 
 from google.analytics.data_v1beta.types import (Dimension, DimensionValue, Metric,
                                                 ResponseMetaData, Row, RunReportResponse)
-from tap_ga4.sync import (REPORT_METADATA_MARKER, build_report_metadata, count_other_rows,
-                          sync_report)
+from tap_ga4.sync import (REPORT_METADATA_KEY, build_report_metadata, count_other_rows, sync,
+                          sync_report, write_report_metadata_state)
 
 REPORT = {"id": "report_id",
           "name": "report_name",
@@ -70,26 +70,30 @@ class TestReportMetadata(unittest.TestCase):
         self.assertEqual(0, metadata["page_rows"])
 
 
-class TestSyncReportLogsMetadata(unittest.TestCase):
-    def run_sync(self, pages_per_window):
+def write_state_events(events):
+    # singer.write_state serializes immediately; snapshot the state the same way.
+    return lambda state: events.append(("state", json.loads(json.dumps(state))))
+
+
+class TestSyncReportWritesMetadataState(unittest.TestCase):
+    def run_sync(self, pages_per_window, state=None):
         client = MagicMock()
         client.get_report.side_effect = [iter(pages) for pages in pages_per_window]
         events = []
-        with patch("tap_ga4.sync.LOGGER") as logger, \
-                patch("tap_ga4.sync.row_to_record", return_value={}), \
+        state = {} if state is None else state
+        with patch("tap_ga4.sync.row_to_record", return_value={}), \
                 patch("tap_ga4.sync.transform_datetimes", side_effect=lambda _, rec: rec), \
                 patch("tap_ga4.sync.Transformer"), \
                 patch("tap_ga4.sync.singer.write_record",
-                      side_effect=lambda *_, **__: events.append("record")), \
-                patch("tap_ga4.sync.singer.write_state"):
-            logger.info.side_effect = lambda fmt, *args: events.append(fmt % args)
-            sync_report(client, {}, REPORT, datetime(2026, 9, 1), datetime(2026, 9, 2), 1, {})
-        markers = [json.loads(e.split(" ", 1)[1]) for e in events
-                   if e.startswith(REPORT_METADATA_MARKER + " ")]
-        return events, markers
+                      side_effect=lambda *_, **__: events.append(("record", None))), \
+                patch("tap_ga4.sync.singer.write_state", side_effect=write_state_events(events)):
+            sync_report(client, {}, REPORT, datetime(2026, 9, 1), datetime(2026, 9, 2), 1, state)
+        markers = [value[REPORT_METADATA_KEY] for kind, value in events
+                   if kind == "state" and REPORT_METADATA_KEY in value]
+        return events, markers, state
 
-    def test_one_line_per_response_before_its_records(self):
-        events, markers = self.run_sync([
+    def test_one_state_per_response_before_its_records(self):
+        events, markers, _ = self.run_sync([
             [make_response([["2026090100", "/a"]], row_count=2),
              make_response([["2026090101", "(other)"]], data_loss=True, row_count=2)],
             [make_response([["2026090200", "/b"]])],
@@ -97,26 +101,58 @@ class TestSyncReportLogsMetadata(unittest.TestCase):
         self.assertEqual([(0, False, 0), (1, True, 1), (0, False, 0)],
                          [(m["page"], m["data_loss_from_other_row"], m["other_rows"]) for m in markers])
         self.assertEqual(["2026-09-01", "2026-09-01", "2026-09-02"], [m["start_date"] for m in markers])
-        kinds = ["marker" if e.startswith(REPORT_METADATA_MARKER) else e for e in events
-                 if e == "record" or e.startswith(REPORT_METADATA_MARKER)]
-        self.assertEqual(["marker", "record", "marker", "record", "marker", "record"], kinds)
+        kinds = ["metadata" if kind == "state" and REPORT_METADATA_KEY in value else kind
+                 for kind, value in events]
+        # Each window ends with the plain bookmark state.
+        self.assertEqual(["metadata", "record", "metadata", "record", "state",
+                          "metadata", "record", "state"], kinds)
 
-    def test_logged_before_record_writing_fails(self):
+    def test_metadata_state_keeps_bookmarks_and_is_not_persisted(self):
+        events, _, state = self.run_sync([[make_response([["2026090100", "/a"]])],
+                                          [make_response([["2026090200", "/b"]])]])
+        states = [value for kind, value in events if kind == "state"]
+        # The second window's metadata state carries the first window's bookmark, unadvanced.
+        bookmark = states[2]["bookmarks"]["report_id"]["123456789"]["last_report_date"]
+        self.assertIn(REPORT_METADATA_KEY, states[2])
+        self.assertEqual("2026-09-01", bookmark)
+        self.assertNotIn(REPORT_METADATA_KEY, states[1])
+        self.assertNotIn(REPORT_METADATA_KEY, states[-1])
+        self.assertNotIn(REPORT_METADATA_KEY, state)
+
+    def test_written_before_record_writing_fails(self):
         client = MagicMock()
         client.get_report.return_value = iter([make_response([["(other)", "(other)"]], data_loss=True)])
-        with patch("tap_ga4.sync.LOGGER") as logger, \
+        events = []
+        with patch("tap_ga4.sync.singer.write_state", side_effect=write_state_events(events)), \
                 patch("tap_ga4.sync.row_to_record", side_effect=ValueError("schema mismatch")):
             with self.assertRaises(ValueError):
                 sync_report(client, {}, REPORT, datetime(2026, 9, 1), datetime(2026, 9, 1), 1, {})
-        logged = [call.args[2] for call in logger.info.call_args_list
-                  if call.args[1:2] == (REPORT_METADATA_MARKER,)]
-        self.assertEqual(1, len(logged))
-        self.assertTrue(json.loads(logged[0])["data_loss_from_other_row"])
+        self.assertEqual(1, len(events))
+        self.assertTrue(events[0][1][REPORT_METADATA_KEY]["data_loss_from_other_row"])
 
-    def test_logged_when_window_has_no_rows(self):
-        _, markers = self.run_sync([[make_response([])], [make_response([])]])
+    def test_written_when_window_has_no_rows(self):
+        _, markers, _ = self.run_sync([[make_response([])], [make_response([])]])
         self.assertEqual(2, len(markers))
         self.assertEqual([0, 0], [m["row_count"] for m in markers])
+
+
+class TestWriteReportMetadataState(unittest.TestCase):
+    def test_key_removed_even_when_write_fails(self):
+        state = {"bookmarks": {}}
+        with patch("tap_ga4.sync.singer.write_state", side_effect=BrokenPipeError):
+            with self.assertRaises(BrokenPipeError):
+                write_report_metadata_state(state, {"page": 0})
+        self.assertEqual({"bookmarks": {}}, state)
+
+
+class TestSyncDropsStaleMetadata(unittest.TestCase):
+    def test_input_state_metadata_removed(self):
+        catalog = MagicMock()
+        catalog.get_selected_streams.return_value = []
+        state = {"bookmarks": {}, REPORT_METADATA_KEY: {"page": 3}}
+        with patch("tap_ga4.sync.singer.write_state"):
+            sync(MagicMock(), {}, catalog, state)
+        self.assertNotIn(REPORT_METADATA_KEY, state)
 
 
 if __name__ == "__main__":
