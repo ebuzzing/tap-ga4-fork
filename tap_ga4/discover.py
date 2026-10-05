@@ -119,6 +119,9 @@ def generate_metadata(schema, dimensions, metrics, invalid_metrics, field_exclus
         mdata = metadata.write(mdata, ("properties", dimension), "behavior", "DIMENSION")
         mdata = metadata.write(mdata, ("properties", dimension), "fieldExclusions", field_exclusions[dimension])
         mdata = metadata.write(mdata, ("properties", dimension), "tap-ga4.api-field-names", dimensions[dimension].api_name)
+        # Per-field regex filtering: populate this list in the generated catalog.json with
+        # GA4 FULL_REGEXP patterns to push filtering down to the GA4 API for this dimension.
+        mdata = metadata.write(mdata, ("properties", dimension), "tap-ga4.field-filter-regexes", [])
         if is_premade:
             mdata = metadata.write(mdata, ("properties", dimension), "selected-by-default", True)
 

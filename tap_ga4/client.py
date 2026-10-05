@@ -8,7 +8,8 @@ from google.analytics.data_v1beta.types import (CheckCompatibilityRequest,
                                                 DateRange, Dimension,
                                                 GetMetadataRequest, Metric,
                                                 OrderBy, RunReportRequest,
-                                                Filter, FilterExpression)
+                                                Filter, FilterExpression,
+                                                FilterExpressionList)
 from google.api_core.exceptions import (ResourceExhausted, ServerError,
                                         TooManyRequests)
 from google.oauth2.credentials import Credentials
@@ -53,6 +54,47 @@ class Client:
             self.client = self._create_service_account_client(config)
         else:
             raise ValueError(f"Unknown auth_type: {auth_type}")
+
+    @staticmethod
+    def _build_field_filter(field_filters):
+        """Build a FilterExpression from a {api_field_name: [regex, ...]} mapping.
+
+        - Each field with N patterns becomes a single Filter (N == 1) or an or_group of N
+          FULL_REGEXP filters.
+        - Multiple fields are AND-grouped together.
+        - Returns None if the map is empty or contains only empty pattern lists.
+        """
+        if not field_filters:
+            return None
+        per_field_expressions = []
+        for field_name, patterns in field_filters.items():
+            if not patterns:
+                continue
+            exprs = [
+                FilterExpression(
+                    filter=Filter(
+                        field_name=field_name,
+                        string_filter=Filter.StringFilter(
+                            value=pattern,
+                            match_type=Filter.StringFilter.MatchType.FULL_REGEXP,
+                        ),
+                    )
+                )
+                for pattern in patterns
+            ]
+            if len(exprs) == 1:
+                per_field_expressions.append(exprs[0])
+            else:
+                per_field_expressions.append(
+                    FilterExpression(or_group=FilterExpressionList(expressions=exprs))
+                )
+        if not per_field_expressions:
+            return None
+        if len(per_field_expressions) == 1:
+            return per_field_expressions[0]
+        return FilterExpression(
+            and_group=FilterExpressionList(expressions=per_field_expressions)
+        )
 
     def _create_oauth_client(self, config):
         """Create a BetaAnalyticsDataClient using OAuth credentials."""
@@ -110,10 +152,13 @@ class Client:
         """
         offset = 0
         has_more_rows = True
-        dimension_filters = None
+        hardcoded_filter = None
         # Dimension filters are hardcoded for premade reports
         if report["name"] in ["conversions_report", "in_app_purchases"]:
-            dimension_filters = self.get_premade_report_dimension_filter(report["name"])
+            hardcoded_filter = self.get_premade_report_dimension_filter(report["name"])
+
+        catalog_field_filter = self._build_field_filter(report.get("field_filters") or {})
+        dimension_filters = self._combine_filters(hardcoded_filter, catalog_field_filter)
 
         while has_more_rows:
             request = RunReportRequest(
@@ -163,6 +208,18 @@ class Client:
             compatibility_filter="INCOMPATIBLE"
             )
         return self._make_request(request)
+
+
+    @staticmethod
+    def _combine_filters(first, second):
+        """AND-combine two optional FilterExpressions. Returns whichever is set, or None."""
+        if first is None:
+            return second
+        if second is None:
+            return first
+        return FilterExpression(
+            and_group=FilterExpressionList(expressions=[first, second])
+        )
 
 
     def get_premade_report_dimension_filter(self, report_name):

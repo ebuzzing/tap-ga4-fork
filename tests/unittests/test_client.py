@@ -1,7 +1,14 @@
 import unittest
 from unittest.mock import patch, MagicMock
 import json
+import proto
+from google.analytics.data_v1beta.types import Filter
 from tap_ga4.client import Client
+
+
+def _which_expr(filter_expression):
+    """Return the name of the populated oneof field on a proto-plus FilterExpression."""
+    return proto.Message.pb(filter_expression).WhichOneof("expr")
 
 
 class TestClientAuthentication(unittest.TestCase):
@@ -111,3 +118,148 @@ class TestClientAuthentication(unittest.TestCase):
 
         # Should use OAuth credentials
         mock_credentials.assert_called_once()
+
+
+def _oauth_config(**extra):
+    config = {
+        'oauth_client_id': 'client-id',
+        'oauth_client_secret': 'client-secret',
+        'refresh_token': 'refresh-token',
+    }
+    config.update(extra)
+    return config
+
+
+def _basic_report():
+    return {
+        "name": "some_report",
+        "property_id": "1234567890",
+        "dimensions": [],
+        "metrics": [],
+    }
+
+
+def _report_with_filters(field_filters, name="some_report"):
+    report = _basic_report()
+    report["name"] = name
+    report["field_filters"] = field_filters
+    return report
+
+
+@patch('tap_ga4.client.BetaAnalyticsDataClient')
+@patch('tap_ga4.client.Credentials')
+class TestCatalogFieldFilter(unittest.TestCase):
+    """Test the catalog-driven per-field regex filter plumbing."""
+
+    def test_empty_map_returns_none(self, _mock_credentials, _mock_client_class):
+        self.assertIsNone(Client._build_field_filter({}))
+        self.assertIsNone(Client._build_field_filter(None))
+
+    def test_all_empty_lists_returns_none(self, _mock_credentials, _mock_client_class):
+        self.assertIsNone(Client._build_field_filter({"landingPagePlusQueryString": []}))
+
+    def test_single_field_single_regex_is_flat(self, _mock_credentials, _mock_client_class):
+        fe = Client._build_field_filter({"landingPagePlusQueryString": ["^/foo/.*"]})
+        self.assertEqual(_which_expr(fe), "filter")
+        self.assertEqual(fe.filter.field_name, "landingPagePlusQueryString")
+        self.assertEqual(fe.filter.string_filter.value, "^/foo/.*")
+        self.assertEqual(
+            fe.filter.string_filter.match_type,
+            Filter.StringFilter.MatchType.FULL_REGEXP,
+        )
+
+    def test_single_field_multiple_regexes_or_grouped(self, _mock_credentials, _mock_client_class):
+        patterns = ["^/foo/.*", "bar", "baz.*qux"]
+        fe = Client._build_field_filter({"landingPagePlusQueryString": patterns})
+        self.assertEqual(_which_expr(fe), "or_group")
+        self.assertEqual(len(fe.or_group.expressions), 3)
+        for child, expected in zip(fe.or_group.expressions, patterns):
+            self.assertEqual(child.filter.field_name, "landingPagePlusQueryString")
+            self.assertEqual(child.filter.string_filter.value, expected)
+
+    def test_multiple_fields_and_grouped(self, _mock_credentials, _mock_client_class):
+        fe = Client._build_field_filter({
+            "landingPagePlusQueryString": ["^/foo/.*"],
+            "eventName": ["click", "view"],
+        })
+        self.assertEqual(_which_expr(fe), "and_group")
+        self.assertEqual(len(fe.and_group.expressions), 2)
+        # First field: single regex → flat filter
+        first = fe.and_group.expressions[0]
+        self.assertEqual(_which_expr(first), "filter")
+        self.assertEqual(first.filter.field_name, "landingPagePlusQueryString")
+        # Second field: 2 regexes → or_group
+        second = fe.and_group.expressions[1]
+        self.assertEqual(_which_expr(second), "or_group")
+        self.assertEqual(len(second.or_group.expressions), 2)
+
+    def test_get_report_passes_catalog_filter(self, _mock_credentials, _mock_client_class):
+        client = Client(_oauth_config())
+        client._make_request = MagicMock(return_value=MagicMock(
+            row_count=0,
+            property_quota=MagicMock(tokens_per_hour=MagicMock(consumed=0)),
+        ))
+
+        list(client.get_report(
+            _report_with_filters({"landingPagePlusQueryString": ["^/foo/.*"]}),
+            "2024-01-01", "2024-01-02",
+        ))
+
+        sent_request = client._make_request.call_args[0][0]
+        self.assertEqual(_which_expr(sent_request.dimension_filter), "filter")
+        self.assertEqual(
+            sent_request.dimension_filter.filter.field_name,
+            "landingPagePlusQueryString",
+        )
+
+    def test_get_report_combines_with_hardcoded_filter(self, _mock_credentials, _mock_client_class):
+        client = Client(_oauth_config())
+        client._make_request = MagicMock(return_value=MagicMock(
+            row_count=0,
+            property_quota=MagicMock(tokens_per_hour=MagicMock(consumed=0)),
+        ))
+
+        list(client.get_report(
+            _report_with_filters(
+                {"landingPagePlusQueryString": ["^/foo/.*"]},
+                name="conversions_report",
+            ),
+            "2024-01-01", "2024-01-02",
+        ))
+
+        sent_request = client._make_request.call_args[0][0]
+        fe = sent_request.dimension_filter
+        self.assertEqual(_which_expr(fe), "and_group")
+        self.assertEqual(len(fe.and_group.expressions), 2)
+        first, second = fe.and_group.expressions
+        self.assertEqual(first.filter.field_name, "isKeyEvent")
+        self.assertEqual(second.filter.field_name, "landingPagePlusQueryString")
+
+    def test_get_report_no_filters_sends_empty_filter(self, _mock_credentials, _mock_client_class):
+        client = Client(_oauth_config())
+        client._make_request = MagicMock(return_value=MagicMock(
+            row_count=0,
+            property_quota=MagicMock(tokens_per_hour=MagicMock(consumed=0)),
+        ))
+
+        list(client.get_report(_basic_report(), "2024-01-01", "2024-01-02"))
+
+        sent_request = client._make_request.call_args[0][0]
+        self.assertIsNone(_which_expr(sent_request.dimension_filter))
+
+    def test_get_report_hardcoded_only_when_no_catalog_filter(self, _mock_credentials, _mock_client_class):
+        client = Client(_oauth_config())
+        client._make_request = MagicMock(return_value=MagicMock(
+            row_count=0,
+            property_quota=MagicMock(tokens_per_hour=MagicMock(consumed=0)),
+        ))
+
+        report = _basic_report()
+        report["name"] = "in_app_purchases"
+        list(client.get_report(report, "2024-01-01", "2024-01-02"))
+
+        sent_request = client._make_request.call_args[0][0]
+        fe = sent_request.dimension_filter
+        self.assertEqual(_which_expr(fe), "filter")
+        self.assertEqual(fe.filter.field_name, "eventName")
+        self.assertEqual(fe.filter.string_filter.value, "in_app_purchase")

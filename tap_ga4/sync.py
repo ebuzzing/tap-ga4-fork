@@ -13,6 +13,12 @@ LOGGER = singer.get_logger()
 DEFAULT_CONVERSION_WINDOW = 90
 DEFAULT_REQUEST_WINDOW_SIZE = 7
 
+# State key carrying the metadata of one RunReport response. It is set only on the STATE
+# message written right after that response, before its records, and is never persisted
+# in later states. Downstream consumers read it; keep the key and field names stable.
+REPORT_METADATA_KEY = "report_metadata"
+OTHER_ROW_VALUE = "(other)"
+
 
 def sort_and_shuffle_streams(currently_syncing, selected_streams):
     """
@@ -131,6 +137,47 @@ def transform_datetimes(report_name, rec):
     return rec
 
 
+def count_other_rows(response):
+    """Count rows where any dimension value is `(other)` (rows GA4 aggregated)."""
+    return sum(1 for row in response.rows
+               if any(dimension.value == OTHER_ROW_VALUE for dimension in row.dimension_values))
+
+
+def build_report_metadata(report, range_start_date, range_end_date, page, response):
+    """
+    Summarize one RunReport response (one page of a date window).
+
+    `data_loss_from_other_row` is populated by GA4 from the aggregated table the report
+    was built from, regardless of filters and limits, so it is set even when a filter
+    removed the `(other)` row itself.
+    """
+    return {
+        "stream": report["name"],
+        "tap_stream_id": report["id"],
+        "property_id": report["property_id"],
+        "start_date": range_start_date,
+        "end_date": range_end_date,
+        "page": page,
+        "dimensions": [dimension.name for dimension in report["dimensions"]],
+        "metrics": [metric.name for metric in report["metrics"]],
+        "data_loss_from_other_row": bool(response.metadata.data_loss_from_other_row),
+        "row_count": response.row_count,
+        "page_rows": len(response.rows),
+        "other_rows": count_other_rows(response),
+        "time_zone": response.metadata.time_zone,
+        "currency_code": response.metadata.currency_code,
+    }
+
+
+def write_report_metadata_state(state, report_metadata):
+    """Write a STATE message carrying `report_metadata` next to the unchanged bookmarks."""
+    state[REPORT_METADATA_KEY] = report_metadata
+    try:
+        singer.write_state(state)
+    finally:
+        state.pop(REPORT_METADATA_KEY, None)
+
+
 def get_report_start_date(config, property_id, state, tap_stream_id):
     """
     Returns the correct report start date.
@@ -184,7 +231,13 @@ def sync_report(client, schema, report, start_date, end_date, request_window_siz
     LOGGER.info("Syncing %s for property_id %s", report['name'], report['property_id'])
 
     for range_start_date, range_end_date in generate_report_dates(start_date, end_date, request_window_size):
-        for response in client.get_report(report, range_start_date, range_end_date):
+        for page, response in enumerate(client.get_report(report, range_start_date, range_end_date)):
+            # Written before the page's records: writing them can still fail (e.g. a `(other)`
+            # dateHour does not match the date-time schema), and the flag must reach the
+            # consumer in exactly that case. The bookmark is not advanced yet, so resuming
+            # from this state still re-syncs the window.
+            write_report_metadata_state(
+                state, build_report_metadata(report, range_start_date, range_end_date, page, response))
             dimension_headers = [dimension.name for dimension in response.dimension_headers]
             metric_headers = [metric.name for metric in response.metric_headers]
             with singer.metrics.record_counter(report['name']) as counter:
@@ -207,6 +260,8 @@ def sync_report(client, schema, report, start_date, end_date, request_window_siz
 
 
 def sync(client, config, catalog, state):
+    # A consumer may have persisted a metadata-carrying state; it describes a past response.
+    state.pop(REPORT_METADATA_KEY, None)
     selected_streams = catalog.get_selected_streams(state)
     currently_syncing = state.get("currently_syncing", None)
     selected_streams = sort_and_shuffle_streams(currently_syncing, selected_streams)
@@ -217,6 +272,7 @@ def sync(client, config, catalog, state):
 
         metrics = []
         dimensions = []
+        field_filters = {}
         mdata = metadata.to_map(stream.metadata)
         for field_path, field_mdata in mdata.items():
             if field_path == tuple():
@@ -226,10 +282,14 @@ def sync(client, config, catalog, state):
             if field_mdata.get("inclusion") == "automatic" or \
                field_mdata.get("selected") or \
                (field_mdata.get("selected-by-default") and field_mdata.get("selected") is None):
+                api_name = field_mdata.get("tap-ga4.api-field-names")
                 if field_mdata.get("behavior") == "METRIC":
-                    metrics.append(Metric(name=field_mdata.get("tap-ga4.api-field-names")))
+                    metrics.append(Metric(name=api_name))
                 elif field_mdata.get("behavior") == "DIMENSION":
-                    dimensions.append(Dimension(name=field_mdata.get("tap-ga4.api-field-names")))
+                    dimensions.append(Dimension(name=api_name))
+                    regexes = field_mdata.get("tap-ga4.field-filter-regexes") or []
+                    if regexes:
+                        field_filters[api_name] = list(regexes)
 
         end_date = get_end_date(config)
         schema = stream.schema.to_dict()
@@ -242,7 +302,8 @@ def sync(client, config, catalog, state):
                   "name": stream.stream,
                   "id": stream.tap_stream_id,
                   "metrics": metrics,
-                  "dimensions": dimensions}
+                  "dimensions": dimensions,
+                  "field_filters": field_filters}
 
         start_date = get_report_start_date(config, report["property_id"], state, report["id"])
         request_window_size = int(config.get("request_window_size", DEFAULT_REQUEST_WINDOW_SIZE))

@@ -106,6 +106,7 @@ def maybe_parse_report_definitions(config):
         except json.JSONDecodeError as e:
             raise ValueError(f"Error parsing report_definitions string: {e}") from e
 
+
 def main_impl():
     args = utils.parse_args(REQUIRED_CONFIG_KEYS)
     catalog = args.catalog or Catalog([])

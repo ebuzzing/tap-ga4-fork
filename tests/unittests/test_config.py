@@ -46,3 +46,5 @@ class TestMaybeParseReportDefinitions(unittest.TestCase):
         maybe_parse_report_definitions(self.config_with_bad_type)
         self.assertIsInstance(self.config_with_bad_type["report_definitions"], int)
         self.assertEqual(self.config_with_bad_type["start_date"], '2024-02-24T00:00:00Z')
+
+
